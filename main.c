@@ -24,52 +24,54 @@ typedef struct {
 typedef struct {
     size_t count;
     size_t capacity;
-    Token *tk;
+    Token *items;
 } tokarr_t;
 
 void accept_input();
 void parse_input(const char *line);
 
-void tk_append(Token *t, int val);
+
+void alloc(tokarr_t *t);
+void items_append_op(tokarr_t *t, char p);
+void items_append_v(tokarr_t *t, int val);
+
+void llvm_jit();
 
 bool is_digit(char c);
 bool is_whitespace(char c);
 bool is_op(char c);
 
 static tokarr_t token = {0};
-static int token_count = 0;
 
 void
-t_alloc(tokarr_t *t)
+alloc(tokarr_t *t)
 {
     if (t->capacity == 0) {
         t->capacity = 256;
-        t->tk = (Token *)malloc(sizeof(t->tk) * t->capacity);
+        t->items = malloc(sizeof(Token) * t->capacity);
     }
     if (t->count >= t->capacity) {
         t->capacity *= 2;
-        t->tk = (Token *)realloc(t->tk, sizeof(t->tk) * t->capacity);
+        t->items = realloc(t->items, sizeof(Token) * t->capacity);
     }
 }
-
 void
-tk_append_v(tokarr_t *t, int val)
+items_append_v(tokarr_t *t, int val)
 {
-    t_alloc(t);
-    t->tk[t->count].value  = val;
-    t->tk[t->count].type = T_VAL;
+    alloc(t);
+    t->items[t->count].value  = val;
+    t->items[t->count].type = T_VAL;
     t->count++;
 }
 
-
 void
-tk_append_op(tokarr_t *t, char p)
+items_append_op(tokarr_t *t, char p)
 {
-    t_alloc(t);
-    t->tk[t->count].op = p;
+    alloc(t);
+    t->items[t->count].op = p;
     switch(p) {
-    case '+': t->tk[t->count].type = T_PLUS; break;
-    case '-': t->tk[t->count].type = T_MINUS; break;
+        case '+': t->items[t->count].type = T_PLUS; break;
+        case '-': t->items[t->count].type = T_MINUS; break;
     }
     t->count++;
 }
@@ -79,6 +81,11 @@ parse_input(const char *line)
 {
     for (int i = 0; i < strlen(line); i++) {
         if (is_whitespace(line[i])) continue;
+        else if (is_op(line[i])) {
+            char p = line[i];
+            items_append_op(&token, p);
+            continue;
+        }
         else if (is_digit(line[i])) {
             int val = 0;
             while((i < strlen(line) && is_digit(line[i])))
@@ -87,23 +94,10 @@ parse_input(const char *line)
                 i++;
             }
             i--;
-            tk_append_v(&token, val);
+            items_append_v(&token, val);
             continue;
         } 
-        else if (is_op(line[i])) {
-            char p = line[i];
-            tk_append_op(&token, p);
-            continue;
-        }
-        printf("%c", line[i]);
     }
-    printf("\n");
-    fflush(stdout);
-    for(size_t i = 0; i < token.count; ++i) {
-        if (token.tk[i].type == T_VAL) printf("TOKEN VALUE: %d\n", token.tk[i].value);
-        else printf("TOKEN OP: %c\n", token.tk[i].op);
-    }
-    printf("\n");
     fflush(stdout);
 }
 
@@ -133,6 +127,7 @@ print:
         buf[strcspn(buf, "\n")] = 0;
         if (strcmp(buf, "exit") == 0) abort();
         parse_input((const char *)buf);
+        llvm_jit();
         goto print;
     }
 }
@@ -157,14 +152,20 @@ llvm_jit()
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, add, "entry");
     LLVMPositionBuilderAtEnd(builder, entry);
 
-    for(size_t i = 0; i < token.count; ++i) {
-        if (token.tk[i].type == T_VAL) printf("TOKEN VALUE: %d\n", token.tk[i].value); // da_append(c, token.tk[i].value)
-        else continue;
+    LLVMValueRef sum = LLVMConstInt( ret, token.items[0].value, 0 );
+    for (size_t i = 1; i + 1 < token.count; i += 2) {
+        Token op  = token.items[i];
+        Token val = token.items[i + 1];
+        
+        LLVMValueRef rhs = LLVMConstInt(ret, val.value, 0);
+        
+        if (op.type == T_PLUS) {
+            sum = LLVMBuildAdd(builder, sum, rhs, "addtmp");
+        } else if (op.type == T_MINUS) {
+            sum = LLVMBuildSub(builder, sum, rhs, "subtmp");
+        }
     }
 
-    LLVMValueRef c1  = LLVMConstInt(ret, 42, 0);
-    LLVMValueRef c2  = LLVMConstInt(ret, 429, 0);
-    LLVMValueRef sum = LLVMBuildAdd(builder, c1, c2, "sum");
     LLVMBuildRet(builder, sum);
 
     LLVMDisposeBuilder(builder);
@@ -183,6 +184,7 @@ llvm_jit()
     LLVMDisposeExecutionEngine(engine);
     LLVMContextDispose(ctx);
 }
+
 int
 main()
 {
