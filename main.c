@@ -9,9 +9,11 @@
 #define ModuleID "module"
 
 typedef enum {
-    T_VAL = 0,
+    T_VAL,
     T_PLUS,
     T_MINUS,
+    T_ASTERIK,
+    T_SLASH, // / for div
     T_END
 } token_t;
 
@@ -27,6 +29,16 @@ typedef struct {
     Token *items;
 } tokarr_t;
 
+typedef struct {
+    LLVMContextRef ctx;
+    LLVMModuleRef mod;
+    LLVMBuilderRef builder;
+    LLVMTypeRef ret;
+    LLVMTypeRef fn;
+    LLVMValueRef tmp;
+    LLVMBasicBlockRef entry;
+} llvm_callback_t;
+
 void accept_input();
 void parse_input(const char *line);
 
@@ -35,7 +47,7 @@ void alloc(tokarr_t *t);
 void items_append_op(tokarr_t *t, char p);
 void items_append_v(tokarr_t *t, int val);
 
-void llvm_jit();
+void llvm_jit_loop();
 
 bool is_digit(char c);
 bool is_whitespace(char c);
@@ -48,11 +60,11 @@ alloc(tokarr_t *t)
 {
     if (t->capacity == 0) {
         t->capacity = 256;
-        t->items = malloc(sizeof(Token) * t->capacity);
+        t->items = malloc(sizeof(*t->items) * t->capacity);
     }
     if (t->count >= t->capacity) {
         t->capacity *= 2;
-        t->items = realloc(t->items, sizeof(Token) * t->capacity);
+        t->items = realloc(t->items, sizeof(*t->items) * t->capacity);
     }
 }
 void
@@ -72,6 +84,12 @@ items_append_op(tokarr_t *t, char p)
     switch(p) {
         case '+': t->items[t->count].type = T_PLUS; break;
         case '-': t->items[t->count].type = T_MINUS; break;
+        case '*': t->items[t->count].type = T_ASTERIK; break;
+        case '/': t->items[t->count].type = T_SLASH; break;
+        default: { 
+            printf("Unknown token '%c'", p); 
+            t->items[t->count].type = T_END; break;
+        } break;
     }
     t->count++;
 }
@@ -101,23 +119,28 @@ parse_input(const char *line)
     fflush(stdout);
 }
 
-bool is_digit(char c) {
+bool
+is_digit(char c)
+{
     return c >= '0' && c <= '9';
 }
 
-bool is_whitespace(char c) {
+bool
+is_whitespace(char c)
+{
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-bool is_op(char c) {
-    return c == '+' || c == '-';
+bool
+is_op(char c)
+{
+   return c == '+' || c == '-' || c == '*' || c == '/';
 }
 
 void
-accept_input()
+accept_input() 
 {
     char buf[256];
-
 print:
     printf(">>> ");
     fflush(stdout);
@@ -127,62 +150,74 @@ print:
         buf[strcspn(buf, "\n")] = 0;
         if (strcmp(buf, "exit") == 0) abort();
         parse_input((const char *)buf);
-        llvm_jit();
+        llvm_jit_loop();
+
         goto print;
     }
 }
 
 void
-llvm_jit()
+llvm_jit_loop()
 {
+    static llvm_callback_t jit = {0};
     LLVMLinkInMCJIT();
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmPrinter();
     LLVMInitializeNativeAsmParser();
 
-    LLVMContextRef ctx = LLVMContextCreate();
-    LLVMModuleRef mod = LLVMModuleCreateWithNameInContext(ModuleID, ctx);
-    LLVMBuilderRef builder = LLVMCreateBuilderInContext(ctx);
+    jit.ctx = LLVMContextCreate();
+    jit.mod = LLVMModuleCreateWithNameInContext(ModuleID, jit.ctx);
+    jit.builder = LLVMCreateBuilderInContext(jit.ctx);
 
-    LLVMTypeRef ret = LLVMInt32TypeInContext(ctx);
-    LLVMTypeRef fn = LLVMFunctionType(ret, NULL, 0, false);
+    jit.ret = LLVMInt32Type();
+    jit.fn = LLVMFunctionType(jit.ret, NULL, 0, false);
 
-    LLVMValueRef add = LLVMAddFunction(mod, "add", fn);
+    jit.tmp = LLVMAddFunction(jit.mod, "tmp", jit.fn);
 
-    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, add, "entry");
-    LLVMPositionBuilderAtEnd(builder, entry);
-
-    LLVMValueRef sum = LLVMConstInt( ret, token.items[0].value, 0 );
+    jit.entry = LLVMAppendBasicBlockInContext(jit.ctx, jit.tmp, "entry");
+    LLVMPositionBuilderAtEnd(jit.builder, jit.entry);
+    LLVMValueRef lhs = LLVMConstInt(jit.ret, token.items[0].value, 0 );
     for (size_t i = 1; i + 1 < token.count; i += 2) {
         Token op  = token.items[i];
         Token val = token.items[i + 1];
         
-        LLVMValueRef rhs = LLVMConstInt(ret, val.value, 0);
-        
-        if (op.type == T_PLUS) {
-            sum = LLVMBuildAdd(builder, sum, rhs, "addtmp");
-        } else if (op.type == T_MINUS) {
-            sum = LLVMBuildSub(builder, sum, rhs, "subtmp");
+        LLVMValueRef rhs = LLVMConstInt(jit.ret, val.value, 0);
+
+        switch(op.type) {
+            case T_PLUS: { 
+                lhs = LLVMBuildAdd(jit.builder, lhs, rhs, "tmp");
+            } break;
+            case T_MINUS: { 
+                lhs = LLVMBuildSub(jit.builder, lhs, rhs, "tmp");
+            } break;
+            case T_ASTERIK: { 
+                lhs = LLVMBuildMul(jit.builder, lhs, rhs, "tmp");
+            } break;
+            case T_SLASH: { 
+                if (rhs != 0) {
+                    lhs = LLVMBuildSDiv(jit.builder, lhs, rhs, "tmp");
+                }
+            } break;
         }
     }
 
-    LLVMBuildRet(builder, sum);
+    LLVMBuildRet(jit.builder, lhs);
 
-    LLVMDisposeBuilder(builder);
+    LLVMDisposeBuilder(jit.builder);
 
     LLVMExecutionEngineRef engine;
     char *err = NULL;
-    if (LLVMCreateExecutionEngineForModule(&engine, mod, &err) != 0) {
+    if (LLVMCreateExecutionEngineForModule(&engine, jit.mod, &err) != 0) {
         fprintf(stderr, "EE error: %s\n", err);
         LLVMDisposeMessage(err);
         return;
     }
 
-    int (*add_func)() = (int (*)())LLVMGetFunctionAddress(engine, "add");
-    printf("Result: %d\n", add_func());
+    int (*tmp_func)() = (int (*)())LLVMGetFunctionAddress(engine, "tmp");
+    printf("Result: %d\n", tmp_func());
 
     LLVMDisposeExecutionEngine(engine);
-    LLVMContextDispose(ctx);
+    LLVMContextDispose(jit.ctx);
 }
 
 int

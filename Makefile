@@ -1,6 +1,6 @@
 CC := clang.exe
 
-CFLAGS := $(shell ../ccalc/llvm-21.1.8-Release/bin/llvm-config.exe --cflags) -g
+CFLAGS := $(shell ../ccalc/llvm-21.1.8-Release/bin/llvm-config.exe --cflags) -O3
 LDLIBS := $(shell ../ccalc/llvm-21.1.8-Release/bin/llvm-config.exe --libs) -ladvapi32 -lntdll
 
 all: main.exe
