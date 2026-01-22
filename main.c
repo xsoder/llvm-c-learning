@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include "llvm-c/Core.h"
 #include "llvm-c/ExecutionEngine.h"
@@ -31,17 +32,16 @@ typedef struct {
 
 typedef struct {
     LLVMContextRef ctx;
-    LLVMModuleRef mod;
     LLVMBuilderRef builder;
     LLVMTypeRef ret;
     LLVMTypeRef fn;
     LLVMValueRef tmp;
-    LLVMBasicBlockRef entry;
     LLVMExecutionEngineRef engine;
+    LLVMBasicBlockRef entry;
     char *err;
 } llvm_callback_t;
 
-void accept_input();
+void accept_input(llvm_callback_t *jit);
 void parse_input(const char *line);
 
 void alloc(tokarr_t *t);
@@ -52,7 +52,8 @@ LLVMValueRef parse_exp(llvm_callback_t *jit);
 LLVMValueRef parse_term(llvm_callback_t *jit);
 LLVMValueRef parse_val(llvm_callback_t *jit);
 
-void llvm_jit_loop();
+void llvm_init(llvm_callback_t *jit);
+void llvm_jit_loop(llvm_callback_t *jit);
 
 bool is_digit(char c);
 bool is_whitespace(char c);
@@ -95,7 +96,8 @@ parse_term(llvm_callback_t *jit)
         rhs = parse_val(jit);
         if (!rhs) return NULL;
 
-        if (op != T_ASTERIK) lhs = LLVMBuildSDiv(jit->builder, lhs,rhs,"divtmp");
+        if (op != T_ASTERIK) lhs = LLVMBuildSDiv(jit->builder,
+lhs,rhs,"divtmp");
         else lhs = LLVMBuildMul(jit->builder, lhs, rhs, "multmp");
         ctx = peek();
     }
@@ -174,8 +176,8 @@ items_append_op(tokarr_t *t, char p)
         case '-': t->items[t->count].type = T_MINUS; break;
         case '*': t->items[t->count].type = T_ASTERIK; break;
         case '/': t->items[t->count].type = T_SLASH; break;
-        default: { 
-            printf("Unknown token '%c'", p); 
+        default: {
+            printf("Unknown token '%c'", p);
             t->items[t->count].type = T_END; break;
         } break;
     }
@@ -202,7 +204,7 @@ parse_input(const char *line)
             i--;
             items_append_v(&token, val);
             continue;
-        } 
+        }
     }
     fflush(stdout);
 }
@@ -226,7 +228,7 @@ is_op(char c)
 }
 
 void
-accept_input() 
+accept_input(llvm_callback_t *jit)
 {
     char buf[256];
 print:
@@ -235,73 +237,86 @@ print:
 
     while (fgets(buf, sizeof(buf), stdin) != NULL) {
         buf[strcspn(buf, "\n")] = 0;
-        if (strcmp(buf, "exit") == 0) abort();
+        if (strcmp(buf, "exit") == 0) exit(EXIT_SUCCESS);
         token.count = 0;
         tok_index = 0;
         parse_input((const char *)buf);
-        llvm_jit_loop();
+        llvm_jit_loop(jit);
 
         goto print;
     }
 }
 
 void
-llvm_jit_loop()
+llvm_init(llvm_callback_t *jit)
 {
-    static llvm_callback_t jit = {0};
+    LLVMLinkInMCJIT();
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+    LLVMInitializeNativeAsmParser();
+
+    jit->ctx = LLVMContextCreate();
+    jit->builder = LLVMCreateBuilderInContext(jit->ctx);
+}
+
+
+void
+llvm_jit_loop(llvm_callback_t *jit)
+{
+    static int expr_id = 0;
     static bool initialized = false;
 
     if (token.count == 0) return;
 
     if (!initialized) {
-        LLVMLinkInMCJIT();
-        LLVMInitializeNativeTarget();
-        LLVMInitializeNativeAsmPrinter();
-        LLVMInitializeNativeAsmParser();
+        llvm_init(jit);
         initialized = true;
     }
+    LLVMModuleRef mod = LLVMModuleCreateWithNameInContext("repl", jit->ctx);
 
-    jit.err = NULL;
+    jit->err = NULL;
 
-    jit.ctx = LLVMContextCreate();
-    jit.mod = LLVMModuleCreateWithNameInContext(ModuleID, jit.ctx);
-    jit.builder = LLVMCreateBuilderInContext(jit.ctx);
+    jit->ret = LLVMInt32Type();
+    jit->fn = LLVMFunctionType(jit->ret, NULL, 0, false);
 
-    jit.ret = LLVMInt32Type();
-    jit.fn = LLVMFunctionType(jit.ret, NULL, 0, false);
+    char name[32];
+    snprintf(name, sizeof(name), "expr%d", expr_id++);
+    jit->tmp = LLVMAddFunction(mod, name, jit->fn);
 
-    jit.tmp = LLVMAddFunction(jit.mod, "tmp", jit.fn);
+    jit->entry = LLVMAppendBasicBlockInContext(jit->ctx, jit->tmp, "entry");
+    LLVMPositionBuilderAtEnd(jit->builder, jit->entry);
 
-    jit.entry = LLVMAppendBasicBlockInContext(jit.ctx, jit.tmp, "entry");
-    LLVMPositionBuilderAtEnd(jit.builder, jit.entry);
-
-    LLVMValueRef final_val = parse_exp(&jit);
+    LLVMValueRef final_val = parse_exp(jit);
 
     if (final_val) {
-        LLVMBuildRet(jit.builder, final_val);
+        if (LLVMCreateExecutionEngineForModule(&jit->engine, mod,
+                &jit->err)) {
+                fprintf(stderr, "%s\n", jit->err);
+            exit(1);
+        }
+        LLVMValueRef ff = LLVMBuildRet(jit->builder, final_val);
 
-        if (LLVMCreateExecutionEngineForModule(&jit.engine, jit.mod, &jit.err)
-            == 0) {
-            int (*tmp_func)() = (int (*)())LLVMGetFunctionAddress(jit.engine,
-                                                                  "tmp");
-            printf("Result: %d\n", tmp_func());
-        fflush(stdout);
+        uint64_t addr = LLVMGetFunctionAddress(jit->engine, name);
+        if (!addr) {
+            fprintf(stderr, "Failed to get function address for %s\n", name);
+            LLVMDeleteFunction(jit->tmp);
+            LLVMDisposeExecutionEngine(jit->engine);
+            return;
+        }
 
-        LLVMDisposeExecutionEngine(jit.engine);
-            } else {
-                fprintf(stderr, "Failed to create execution engine: %s\n",
-                        jit.err);
-                LLVMDisposeMessage(jit.err);
-                LLVMDisposeModule(jit.mod);
-            }
+        int (*tmp_func)() = (int (*)())addr;
+        printf("Result: %d\n", tmp_func());
+        LLVMDisposeModule(mod);
     }
-
-    LLVMContextDispose(jit.ctx);
 }
 
 int
 main()
 {
-    accept_input();
+    static llvm_callback_t jit = {0};
+    accept_input(&jit);
+
+    LLVMDisposeExecutionEngine(jit.engine);
+    LLVMContextDispose(jit.ctx);
     return 0;
 }
