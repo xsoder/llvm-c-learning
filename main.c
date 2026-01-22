@@ -13,7 +13,7 @@ typedef enum {
     T_PLUS,
     T_MINUS,
     T_ASTERIK,
-    T_SLASH, // / for div
+    T_SLASH,
     T_END
 } token_t;
 
@@ -37,15 +37,20 @@ typedef struct {
     LLVMTypeRef fn;
     LLVMValueRef tmp;
     LLVMBasicBlockRef entry;
+    LLVMExecutionEngineRef engine;
+    char *err;
 } llvm_callback_t;
 
 void accept_input();
 void parse_input(const char *line);
 
-
 void alloc(tokarr_t *t);
 void items_append_op(tokarr_t *t, char p);
 void items_append_v(tokarr_t *t, int val);
+
+LLVMValueRef parse_exp(llvm_callback_t *jit);
+LLVMValueRef parse_term(llvm_callback_t *jit);
+LLVMValueRef parse_val(llvm_callback_t *jit);
 
 void llvm_jit_loop();
 
@@ -53,7 +58,90 @@ bool is_digit(char c);
 bool is_whitespace(char c);
 bool is_op(char c);
 
+Token *peek();
+void advance();
+
 static tokarr_t token = {0};
+size_t tok_index = 0;
+
+LLVMValueRef
+parse_val(llvm_callback_t *jit)
+{
+    Token *ctk = peek();
+    LLVMValueRef lhs = NULL;
+
+    if (ctk->type == T_VAL) {
+        lhs = LLVMConstInt(jit->ret, ctk->value, 0);
+        advance();
+    }else {
+        fprintf(stderr, "Expected value\n");
+        return NULL;
+    }
+    return lhs;
+}
+
+LLVMValueRef
+parse_term(llvm_callback_t *jit)
+{
+    LLVMValueRef lhs = parse_val(jit);
+    if (!lhs) return NULL;
+
+    Token *ctx = peek();
+    LLVMValueRef rhs = NULL;
+
+    while (ctx && (ctx->type == T_SLASH || ctx->type == T_ASTERIK)) {
+        int op = ctx->type;
+        advance();
+        rhs = parse_val(jit);
+        if (!rhs) return NULL;
+
+        if (op != T_ASTERIK) lhs = LLVMBuildSDiv(jit->builder, lhs,rhs,"divtmp");
+        else lhs = LLVMBuildMul(jit->builder, lhs, rhs, "multmp");
+        ctx = peek();
+    }
+    return lhs;
+}
+LLVMValueRef
+parse_exp(llvm_callback_t *jit)
+{
+    LLVMValueRef lhs = parse_term(jit);
+    if (!lhs) return NULL;
+
+    Token *ctx = peek();
+    while (ctx) {
+        if (ctx->type == T_PLUS || ctx->type == T_MINUS) {
+            int op = ctx->type;
+            advance();
+            LLVMValueRef rhs = parse_term(jit);
+            if (!rhs) return NULL;
+
+            if (op == T_PLUS)
+                lhs = LLVMBuildAdd(jit->builder, lhs, rhs, "addtmp");
+            else
+                lhs = LLVMBuildSub(jit->builder, lhs, rhs, "subtmp");
+        } else {
+            break;
+        }
+        ctx = peek();
+    }
+
+    return lhs;
+}
+
+
+Token*
+peek()
+{
+    if (tok_index < token.count)
+        return &token.items[tok_index];
+    return NULL;
+}
+
+void
+advance()
+{
+    tok_index++;
+}
 
 void
 alloc(tokarr_t *t)
@@ -144,11 +232,12 @@ accept_input()
 print:
     printf(">>> ");
     fflush(stdout);
-    token.count = 0;
 
     while (fgets(buf, sizeof(buf), stdin) != NULL) {
         buf[strcspn(buf, "\n")] = 0;
         if (strcmp(buf, "exit") == 0) abort();
+        token.count = 0;
+        tok_index = 0;
         parse_input((const char *)buf);
         llvm_jit_loop();
 
@@ -160,10 +249,19 @@ void
 llvm_jit_loop()
 {
     static llvm_callback_t jit = {0};
-    LLVMLinkInMCJIT();
-    LLVMInitializeNativeTarget();
-    LLVMInitializeNativeAsmPrinter();
-    LLVMInitializeNativeAsmParser();
+    static bool initialized = false;
+
+    if (token.count == 0) return;
+
+    if (!initialized) {
+        LLVMLinkInMCJIT();
+        LLVMInitializeNativeTarget();
+        LLVMInitializeNativeAsmPrinter();
+        LLVMInitializeNativeAsmParser();
+        initialized = true;
+    }
+
+    jit.err = NULL;
 
     jit.ctx = LLVMContextCreate();
     jit.mod = LLVMModuleCreateWithNameInContext(ModuleID, jit.ctx);
@@ -176,47 +274,28 @@ llvm_jit_loop()
 
     jit.entry = LLVMAppendBasicBlockInContext(jit.ctx, jit.tmp, "entry");
     LLVMPositionBuilderAtEnd(jit.builder, jit.entry);
-    LLVMValueRef lhs = LLVMConstInt(jit.ret, token.items[0].value, 0 );
-    for (size_t i = 1; i + 1 < token.count; i += 2) {
-        Token op  = token.items[i];
-        Token val = token.items[i + 1];
-        
-        LLVMValueRef rhs = LLVMConstInt(jit.ret, val.value, 0);
 
-        switch(op.type) {
-            case T_PLUS: { 
-                lhs = LLVMBuildAdd(jit.builder, lhs, rhs, "tmp");
-            } break;
-            case T_MINUS: { 
-                lhs = LLVMBuildSub(jit.builder, lhs, rhs, "tmp");
-            } break;
-            case T_ASTERIK: { 
-                lhs = LLVMBuildMul(jit.builder, lhs, rhs, "tmp");
-            } break;
-            case T_SLASH: { 
-                if (rhs != 0) {
-                    lhs = LLVMBuildSDiv(jit.builder, lhs, rhs, "tmp");
-                }
-            } break;
-        }
+    LLVMValueRef final_val = parse_exp(&jit);
+
+    if (final_val) {
+        LLVMBuildRet(jit.builder, final_val);
+
+        if (LLVMCreateExecutionEngineForModule(&jit.engine, jit.mod, &jit.err)
+            == 0) {
+            int (*tmp_func)() = (int (*)())LLVMGetFunctionAddress(jit.engine,
+                                                                  "tmp");
+            printf("Result: %d\n", tmp_func());
+        fflush(stdout);
+
+        LLVMDisposeExecutionEngine(jit.engine);
+            } else {
+                fprintf(stderr, "Failed to create execution engine: %s\n",
+                        jit.err);
+                LLVMDisposeMessage(jit.err);
+                LLVMDisposeModule(jit.mod);
+            }
     }
 
-    LLVMBuildRet(jit.builder, lhs);
-
-    LLVMDisposeBuilder(jit.builder);
-
-    LLVMExecutionEngineRef engine;
-    char *err = NULL;
-    if (LLVMCreateExecutionEngineForModule(&engine, jit.mod, &err) != 0) {
-        fprintf(stderr, "EE error: %s\n", err);
-        LLVMDisposeMessage(err);
-        return;
-    }
-
-    int (*tmp_func)() = (int (*)())LLVMGetFunctionAddress(engine, "tmp");
-    printf("Result: %d\n", tmp_func());
-
-    LLVMDisposeExecutionEngine(engine);
     LLVMContextDispose(jit.ctx);
 }
 
