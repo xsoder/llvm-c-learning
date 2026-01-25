@@ -5,8 +5,10 @@ LDLIBS := $(shell ../ccalc/llvm-21.1.8-Release/bin/llvm-config.exe --libs) -ladv
 
 all: main.exe
 
-main.exe: main.c
-	$(CC) $(CFLAGS) -o main.exe main.c $(LDLIBS)
+
+
+main.exe: main.c lexer.c
+	$(CC) $(CFLAGS) -o main.exe main.c lexer.c $(LDLIBS)
 
 clean:
 	del main.exe

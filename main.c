@@ -9,26 +9,10 @@
 
 #define ModuleID "module"
 
-typedef enum {
-    T_VAL,
-    T_PLUS,
-    T_MINUS,
-    T_ASTERIK,
-    T_SLASH,
-    T_END
-} token_t;
+#include "lexer.h"
 
-typedef struct {
-    int  value;
-    int  type;
-    char op;
-} Token;
-
-typedef struct {
-    size_t count;
-    size_t capacity;
-    Token *items;
-} tokarr_t;
+static tokarr_t token = {0};
+static size_t tok_index = 0;
 
 typedef struct {
     LLVMContextRef ctx;
@@ -42,11 +26,6 @@ typedef struct {
 } llvm_callback_t;
 
 void accept_input(llvm_callback_t *jit);
-void parse_input(const char *line);
-
-void alloc(tokarr_t *t);
-void items_append_op(tokarr_t *t, char p);
-void items_append_v(tokarr_t *t, int val);
 
 LLVMValueRef parse_exp(llvm_callback_t *jit);
 LLVMValueRef parse_term(llvm_callback_t *jit);
@@ -55,25 +34,15 @@ LLVMValueRef parse_val(llvm_callback_t *jit);
 void llvm_init(llvm_callback_t *jit);
 void llvm_jit_loop(llvm_callback_t *jit);
 
-bool is_digit(char c);
-bool is_whitespace(char c);
-bool is_op(char c);
-
-Token *peek();
-void advance();
-
-static tokarr_t token = {0};
-size_t tok_index = 0;
-
 LLVMValueRef
 parse_val(llvm_callback_t *jit)
 {
-    Token *ctk = peek();
+    token_s *ctk = peek(&token, &tok_index);
     LLVMValueRef lhs = NULL;
 
     if (ctk->type == T_VAL) {
         lhs = LLVMConstInt(jit->ret, ctk->value, 0);
-        advance();
+        advance(&tok_index);
     }else {
         fprintf(stderr, "Expected value\n");
         return NULL;
@@ -87,33 +56,34 @@ parse_term(llvm_callback_t *jit)
     LLVMValueRef lhs = parse_val(jit);
     if (!lhs) return NULL;
 
-    Token *ctx = peek();
+    token_s *ctx = peek(&token, &tok_index);
     LLVMValueRef rhs = NULL;
 
     while (ctx && (ctx->type == T_SLASH || ctx->type == T_ASTERIK)) {
         int op = ctx->type;
-        advance();
+        advance(&tok_index);
         rhs = parse_val(jit);
         if (!rhs) return NULL;
 
         if (op != T_ASTERIK) lhs = LLVMBuildSDiv(jit->builder,
 lhs,rhs,"divtmp");
         else lhs = LLVMBuildMul(jit->builder, lhs, rhs, "multmp");
-        ctx = peek();
+        ctx = peek(&token, &tok_index);
     }
     return lhs;
 }
+
 LLVMValueRef
 parse_exp(llvm_callback_t *jit)
 {
     LLVMValueRef lhs = parse_term(jit);
     if (!lhs) return NULL;
 
-    Token *ctx = peek();
+    token_s *ctx = peek(&token, &tok_index);
     while (ctx) {
         if (ctx->type == T_PLUS || ctx->type == T_MINUS) {
             int op = ctx->type;
-            advance();
+            advance(&tok_index);
             LLVMValueRef rhs = parse_term(jit);
             if (!rhs) return NULL;
 
@@ -124,107 +94,10 @@ parse_exp(llvm_callback_t *jit)
         } else {
             break;
         }
-        ctx = peek();
+        ctx = peek(&token, &tok_index);
     }
 
     return lhs;
-}
-
-
-Token*
-peek()
-{
-    if (tok_index < token.count)
-        return &token.items[tok_index];
-    return NULL;
-}
-
-void
-advance()
-{
-    tok_index++;
-}
-
-void
-alloc(tokarr_t *t)
-{
-    if (t->capacity == 0) {
-        t->capacity = 256;
-        t->items = malloc(sizeof(*t->items) * t->capacity);
-    }
-    if (t->count >= t->capacity) {
-        t->capacity *= 2;
-        t->items = realloc(t->items, sizeof(*t->items) * t->capacity);
-    }
-}
-void
-items_append_v(tokarr_t *t, int val)
-{
-    alloc(t);
-    t->items[t->count].value  = val;
-    t->items[t->count].type = T_VAL;
-    t->count++;
-}
-
-void
-items_append_op(tokarr_t *t, char p)
-{
-    alloc(t);
-    t->items[t->count].op = p;
-    switch(p) {
-        case '+': t->items[t->count].type = T_PLUS; break;
-        case '-': t->items[t->count].type = T_MINUS; break;
-        case '*': t->items[t->count].type = T_ASTERIK; break;
-        case '/': t->items[t->count].type = T_SLASH; break;
-        default: {
-            printf("Unknown token '%c'", p);
-            t->items[t->count].type = T_END; break;
-        } break;
-    }
-    t->count++;
-}
-
-void
-parse_input(const char *line)
-{
-    for (int i = 0; i < strlen(line); i++) {
-        if (is_whitespace(line[i])) continue;
-        else if (is_op(line[i])) {
-            char p = line[i];
-            items_append_op(&token, p);
-            continue;
-        }
-        else if (is_digit(line[i])) {
-            int val = 0;
-            while((i < strlen(line) && is_digit(line[i])))
-            {
-                val = val * 10 + (line[i] - '0');
-                i++;
-            }
-            i--;
-            items_append_v(&token, val);
-            continue;
-        }
-    }
-    fflush(stdout);
-}
-
-bool
-is_digit(char c)
-{
-    return c >= '0' && c <= '9';
-}
-
-bool
-is_whitespace(char c)
-{
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
-bool
-is_op(char c)
-{
-   return c == '+' || c == '-' || c == '*' || c == '/';
 }
 
 void
@@ -240,7 +113,7 @@ print:
         if (strcmp(buf, "exit") == 0) exit(EXIT_SUCCESS);
         token.count = 0;
         tok_index = 0;
-        parse_input((const char *)buf);
+        parse_input((const char *)buf, &token);
         llvm_jit_loop(jit);
 
         goto print;
@@ -306,6 +179,8 @@ llvm_jit_loop(llvm_callback_t *jit)
 
         int (*tmp_func)() = (int (*)())addr;
         printf("Result: %d\n", tmp_func());
+        printf("%s\n", LLVMGetDataLayout(mod));
+        LLVMDumpModule(mod);
         LLVMDisposeModule(mod);
     }
 }
